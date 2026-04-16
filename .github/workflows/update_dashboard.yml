@@ -31,6 +31,6 @@ jobs:
         run: |
           git config user.name "Price Bot"
           git config user.email "bot@boltsc.com"
-          git add docs/ data/ price_history.json monthly_history.json
+          git add docs/ data/ price_history.json
           git diff --cached --quiet || git commit -m "📊 Update prices $(date +'%Y-%m-%d')"
           git push
