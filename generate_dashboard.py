@@ -219,50 +219,39 @@ class PriceFetcher:
     # ----------------------------------------------------------
 
     def fetch_dailymetal(self, metal_code: str) -> dict | None:
-        """从 dailymetalprice.com 获取金属价格 (CNY/kg)"""
+        """用 Playwright 从 dailymetalprice.com 获取金属价格 (USD/kg → CNY)"""
         url = (
             f"https://www.dailymetalprice.com/metalprices.php"
-            f"?c={metal_code}&u=kg&d=1&x=CNY"
+            f"?c={metal_code}&u=kg&d=1&x=USD"
         )
         try:
-            resp = self.session.get(url, timeout=15)
-            resp.encoding = "utf-8"
-            soup = BeautifulSoup(resp.text, "html.parser")
+            ctx = self._get_browser()
+            page = ctx.new_page()
+            logger.info(f"  playwright: loading {url}")
+            page.goto(url, wait_until="networkidle", timeout=30000)
+            # 等表格渲染
+            page.wait_for_selector("table", timeout=10000)
+            html = page.content()
+            page.close()
 
-            table = soup.find("table")
-            if table:
+            soup = BeautifulSoup(html, "html.parser")
+            for table in soup.find_all("table"):
                 rows = table.find_all("tr")
-                for row in rows[1:]:  # 跳过表头
-                    cells = row.find_all("td")
-                    if len(cells) >= 2:
-                        price_text = cells[0].get_text(strip=True)
-                        # 移除货币符号，处理逗号
-                        price_text = re.sub(r"[¥,$€£]", "", price_text)
-                        price_text = price_text.replace(",", "").strip()
-                        price = float(price_text)
-                        if price > 0:
-                            return {"price": round(price, 2), "change_pct": 0}
-
-            # Fallback: 尝试 USD 版本然后换算
-            url_usd = (
-                f"https://www.dailymetalprice.com/metalprices.php"
-                f"?c={metal_code}&u=kg&d=1&x=USD"
-            )
-            resp2 = self.session.get(url_usd, timeout=15)
-            soup2 = BeautifulSoup(resp2.text, "html.parser")
-            table2 = soup2.find("table")
-            if table2:
-                for row in table2.find_all("tr")[1:]:
+                for row in rows[1:]:
                     cells = row.find_all("td")
                     if len(cells) >= 2:
                         price_text = cells[0].get_text(strip=True)
                         price_text = re.sub(r"[¥,$€£]", "", price_text)
                         price_text = price_text.replace(",", "").strip()
-                        price_usd = float(price_text)
-                        if price_usd > 0:
-                            # 粗略汇率 USD→CNY
+                        try:
+                            price_usd = float(price_text)
+                        except ValueError:
+                            continue
+                        if price_usd > 10:  # 钕至少几十美元/kg
                             cny = round(price_usd * 7.1, 2)
-                            logger.info(f"  dailymetal: USD {price_usd} → CNY {cny}")
+                            logger.info(
+                                f"  dailymetal: USD {price_usd} → CNY {cny}"
+                            )
                             return {"price": cny, "change_pct": 0}
 
         except Exception as e:
@@ -296,9 +285,18 @@ class PriceFetcher:
             ctx = self._get_browser()
             page = ctx.new_page()
             logger.info(f"  playwright: loading {url}")
-            page.goto(url, wait_until="networkidle", timeout=30000)
-            # 等安全检查通过，最多等 15 秒
-            page.wait_for_timeout(3000)
+            page.goto(url, wait_until="networkidle", timeout=45000)
+
+            # 等安全检查通过: 反复检测页面是否出现真实内容
+            # 安全检查页只有 "正在进行安全检查" 文字，真实页面有 "价格" 或 table
+            for attempt in range(10):
+                page.wait_for_timeout(2000)
+                text = page.inner_text("body")
+                if "价格" in text or "均价" in text or "报价" in text:
+                    logger.info(f"  playwright: 真实页面已加载 (attempt {attempt+1})")
+                    break
+                if attempt == 9:
+                    logger.warning("  playwright: 10次等待后仍未检测到真实内容")
 
             html = page.content()
             page.close()
@@ -318,11 +316,13 @@ class PriceFetcher:
                         )
                         if nums:
                             val = float(nums[0])
-                            if val > 100:  # 价格应该 > 100
+                            # 价格必须 > 3000 (所有材料至少几千/吨)
+                            # 排除年份 2024/2025/2026 等
+                            if val > 3000:
                                 price = val
                                 break
 
-            # 策略 2: 文本搜索
+            # 策略 2: 文本搜索 "均价 12345" 模式
             if price is None:
                 text = soup.get_text()
                 matches = re.findall(
@@ -330,27 +330,32 @@ class PriceFetcher:
                 )
                 for m in matches:
                     val = float(m.replace(",", ""))
-                    if val > 100:
+                    if val > 3000:
                         price = val
                         break
 
-            # 策略 3: 找所有看起来像价格的大数字
+            # 策略 3: 找所有合理范围的数字 (4000~500000)
             if price is None:
                 text = soup.get_text()
                 candidates = re.findall(r"\b(\d{4,6}(?:\.\d{1,2})?)\b", text)
-                # 按大小排序，取最合理的
-                nums = sorted([float(c) for c in candidates if 1000 < float(c) < 500000], reverse=True)
-                if nums:
-                    # 取中位数附近的值，避免极端值
-                    price = nums[len(nums) // 2]
+                valid = [
+                    float(c) for c in candidates
+                    if 4000 < float(c) < 500000
+                    and float(c) not in range(2020, 2030)  # 排除年份
+                ]
+                if valid:
+                    # 取出现最多的值（众数），或中位数
+                    from collections import Counter
+                    counts = Counter(valid)
+                    price = counts.most_common(1)[0][0]
 
             if price:
                 return {"price": price, "change_pct": 0}
             else:
-                logger.warning(f"  playwright: 未能从页面解析出价格")
-                # 打印一些调试信息
-                text = soup.get_text()[:500]
-                logger.info(f"  page text preview: {text[:200]}")
+                logger.warning(f"  playwright: 未能解析出有效价格 (>{3000})")
+                # 调试信息
+                text = soup.get_text()[:300].replace("\n", " ")
+                logger.info(f"  page preview: {text}")
 
         except Exception as e:
             logger.warning(f"playwright fetch failed for {product_id}: {e}")
